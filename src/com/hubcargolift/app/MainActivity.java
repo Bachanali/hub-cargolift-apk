@@ -5,7 +5,6 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.BroadcastReceiver;
-import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -26,7 +25,6 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.view.View;
 import android.view.WindowManager;
@@ -50,9 +48,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -88,12 +83,10 @@ public class MainActivity extends Activity {
     private static final int MAX_AUTO_LOGIN = 3;
     private static final long AUTO_LOGIN_GAP_MS = 15000L;
     private static final int REQ_STORAGE = 41;
-    private static final int REQ_EXPORT_STORAGE = 42;
-    private static final int REQ_FOLDER = 43;
+    private static final int REQ_SAVE_DOC = 44;
 
     private static final String UPDATE_URL =
             "https://raw.githubusercontent.com/Bachanali/hub-cargolift-apk/main/version.json";
-    private static final String KEY_EXPORT_FOLDER = "export_folder_uri";
     private static final String KEY_SEEN_UPDATE = "seen_update";
 
     private static final String PAGE_TOKEN_KEY = "cargo_lift_token";
@@ -263,8 +256,6 @@ public class MainActivity extends Activity {
     private long lastNativeExportAt;
     private String pendingExportName;
     private byte[] pendingExportBytes;
-    private String exportFolderUri = "";
-    private TextView exportFolderLabel;
     private long updateDownloadId = -1L;
     private BroadcastReceiver downloadReceiver;
 
@@ -718,61 +709,25 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- native export
 
-    /** App-owned "Save As" dialog - replaces the browser download/save UI for exports. */
-    private void showSaveDialog(String name, byte[] bytes) {
+    /** Android's built-in Save As (system document picker). The user picks the name and
+     *  folder; the bytes are written straight to the returned content:// URI. */
+    private void launchSaveAs(String name, byte[] bytes) {
         if (isFinishing() || isDestroyed()) return;
-        View view = getLayoutInflater().inflate(R.layout.dialog_save_export, null);
-        EditText input = view.findViewById(R.id.export_name);
-        input.setText(name);
-        input.setSelection(name.length());
-        exportFolderLabel = view.findViewById(R.id.export_folder);
-        exportFolderUri = prefs.getString(KEY_EXPORT_FOLDER, "");
-        updateFolderLabel();
-
-        view.findViewById(R.id.export_choose).setOnClickListener(v -> {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                    | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
-            try {
-                startActivityForResult(intent, REQ_FOLDER);
-            } catch (Exception e) {
-                Toast.makeText(this, R.string.export_failed, Toast.LENGTH_SHORT).show();
-            }
-        });
-        view.findViewById(R.id.export_default).setOnClickListener(v -> {
-            exportFolderUri = "";
-            prefs.edit().putString(KEY_EXPORT_FOLDER, "").apply();
-            updateFolderLabel();
-        });
-
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.save_export_title)
-                .setView(view)
-                .setPositiveButton(R.string.save_export_action, (dialog, which) -> {
-                    String typed = input.getText().toString().trim();
-                    if (typed.isEmpty()) typed = name;
-                    typed = typed.replaceAll("[\\\\/:*?\"<>|]", "_");
-                    writeExport(typed, bytes);
-                })
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
-    }
-
-    private void updateFolderLabel() {
-        if (exportFolderLabel == null) return;
-        if (exportFolderUri == null || exportFolderUri.isEmpty()) {
-            exportFolderLabel.setText(R.string.export_default_label);
-            return;
-        }
+        pendingExportName = name;
+        pendingExportBytes = bytes;
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(mimeFor(name));
+        intent.putExtra(Intent.EXTRA_TITLE, name);
+        intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         try {
-            Uri tree = Uri.parse(exportFolderUri);
-            String id = DocumentsContract.getTreeDocumentId(tree);
-            String shown = id.contains("/") ? id.substring(id.lastIndexOf('/') + 1) : id;
-            exportFolderLabel.setText(getString(R.string.export_save_to) + ": " + shown);
+            startActivityForResult(intent, REQ_SAVE_DOC);
         } catch (Exception e) {
-            exportFolderLabel.setText(R.string.export_default_label);
+            pendingExportName = null;
+            pendingExportBytes = null;
+            Toast.makeText(this, R.string.export_failed, Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -780,113 +735,32 @@ public class MainActivity extends Activity {
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_FOLDER || resultCode != RESULT_OK
-                || data == null || data.getData() == null) return;
-        Uri tree = data.getData();
-        try {
-            getContentResolver().takePersistableUriPermission(tree,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        } catch (Exception ignored) {
-            // some providers do not allow persisting; selection still works for this save
-        }
-        exportFolderUri = tree.toString();
-        prefs.edit().putString(KEY_EXPORT_FOLDER, exportFolderUri).apply();
-        updateFolderLabel();
+        if (requestCode != REQ_SAVE_DOC) return;
+        byte[] bytes = pendingExportBytes;
+        String name = pendingExportName;
+        pendingExportBytes = null;
+        pendingExportName = null;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null || bytes == null) return;
+        saveToUri(data.getData(), name, bytes);
     }
 
-    private void writeExport(String name, byte[] bytes) {
-        String chosenFolder = exportFolderUri;
-        if (chosenFolder == null || chosenFolder.isEmpty()) {
-            chosenFolder = prefs.getString(KEY_EXPORT_FOLDER, "");
-        }
-        if (chosenFolder != null && !chosenFolder.isEmpty()) {
-            final String folder = chosenFolder;
-            new Thread(() -> {
-                boolean ok = false;
-                try {
-                    Uri tree = Uri.parse(folder);
-                    Uri doc = DocumentsContract.createDocument(
-                            getContentResolver(), tree, mimeFor(name), name);
-                    if (doc == null) {
-                        int dot = name.lastIndexOf('.');
-                        String stem = dot > 0 ? name.substring(0, dot) : name;
-                        String ext = dot > 0 ? name.substring(dot) : "";
-                        doc = DocumentsContract.createDocument(getContentResolver(), tree,
-                                mimeFor(name), stem + "_" + System.currentTimeMillis() + ext);
-                    }
-                    if (doc != null) {
-                        try (OutputStream os = getContentResolver().openOutputStream(doc)) {
-                            if (os != null) {
-                                os.write(bytes);
-                                os.flush();
-                                ok = true;
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    ok = false;
-                }
-                final boolean saved = ok;
-                runOnUiThread(() -> Toast.makeText(this,
-                        saved ? getString(R.string.export_saved_custom, name)
-                                : getString(R.string.export_failed),
-                        Toast.LENGTH_LONG).show());
-            }, "hub-cargolift-export").start();
-            return;
-        }
-
-        if (Build.VERSION.SDK_INT < 29
-                && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                != PackageManager.PERMISSION_GRANTED) {
-            pendingExportName = name;
-            pendingExportBytes = bytes;
-            requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE},
-                    REQ_EXPORT_STORAGE);
-            return;
-        }
+    private void saveToUri(Uri uri, String name, byte[] bytes) {
         new Thread(() -> {
             boolean ok = false;
-            try {
-                if (Build.VERSION.SDK_INT >= 29) {
-                    // content://media/external/downloads == MediaStore.Downloads (API 29+),
-                    // written with plain column names so older devices never resolve that class.
-                    ContentValues values = new ContentValues();
-                    values.put("_display_name", name);
-                    values.put("mime_type", mimeFor(name));
-                    values.put("relative_path", Environment.DIRECTORY_DOWNLOADS + "/Hub Cargolift");
-                    Uri uri = getContentResolver().insert(
-                            Uri.parse("content://media/external/downloads"), values);
-                    if (uri != null) {
-                        try (OutputStream os = getContentResolver().openOutputStream(uri)) {
-                            if (os != null) {
-                                os.write(bytes);
-                                os.flush();
-                                ok = true;
-                            }
-                        }
-                    }
-                } else {
-                    File dir = new File(Environment.getExternalStoragePublicDirectory(
-                            Environment.DIRECTORY_DOWNLOADS), "Hub Cargolift");
-                    if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create folder");
-                    File out = new File(dir, name);
-                    if (out.exists()) {
-                        int dot = name.lastIndexOf('.');
-                        String stem = dot > 0 ? name.substring(0, dot) : name;
-                        String ext = dot > 0 ? name.substring(dot) : "";
-                        out = new File(dir, stem + "_" + System.currentTimeMillis() + ext);
-                    }
-                    try (FileOutputStream fos = new FileOutputStream(out)) {
-                        fos.write(bytes);
-                    }
+            try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                if (os != null) {
+                    os.write(bytes);
+                    os.flush();
                     ok = true;
                 }
             } catch (Exception e) {
                 ok = false;
             }
             final boolean saved = ok;
+            final String shown = name == null ? "export" : name;
             runOnUiThread(() -> Toast.makeText(this,
-                    saved ? getString(R.string.export_saved, name) : getString(R.string.export_failed),
+                    saved ? getString(R.string.export_saved_system, shown)
+                            : getString(R.string.export_failed),
                     Toast.LENGTH_LONG).show());
         }, "hub-cargolift-export").start();
     }
@@ -903,20 +777,6 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_EXPORT_STORAGE) {
-            String name = pendingExportName;
-            byte[] bytes = pendingExportBytes;
-            pendingExportName = null;
-            pendingExportBytes = null;
-            if (name != null && bytes != null
-                    && grantResults.length > 0
-                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                writeExport(name, bytes);
-            } else {
-                Toast.makeText(this, R.string.export_failed, Toast.LENGTH_SHORT).show();
-            }
-            return;
-        }
         if (requestCode != REQ_STORAGE) return;
         String[] job = pendingDownload;
         pendingDownload = null;
@@ -975,7 +835,7 @@ public class MainActivity extends Activity {
                 lastNativeExportAt = System.currentTimeMillis();
                 String safe = (name == null || name.trim().isEmpty())
                         ? "cargo_lift_export" : name.trim();
-                runOnUiThread(() -> showSaveDialog(safe, bytes));
+                runOnUiThread(() -> launchSaveAs(safe, bytes));
             } catch (Exception ignored) {
                 // invalid blob - nothing to save
             }
