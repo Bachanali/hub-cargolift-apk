@@ -21,4 +21,15 @@
     <string name="save_export_action">Save</string>
     <string name="export_saved">Saved to Downloads/Hub Cargolift/%1$s</string>
     <string name="export_failed">Couldn\'t save the export</string>
+    <string name="export_saved_custom">Saved to chosen folder: %1$s</string>
+    <string name="export_file_name">File name</string>
+    <string name="export_save_to">Save to</string>
+    <string name="export_choose_folder">Choose folder</string>
+    <string name="export_default_folder">Default</string>
+    <string name="export_default_label">Downloads / Hub Cargolift</string>
+    <string name="update_title">Update available</string>
+    <string name="update_message">Version %1$s is ready.\n%2$s</string>
+    <string name="update_download">Download &amp; install</string>
+    <string name="update_later">Later</string>
+    <string name="update_failed">Couldn\'t download the update</string>
 </resources>

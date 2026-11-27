@@ -4,12 +4,15 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -23,6 +26,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.view.View;
 import android.view.WindowManager;
@@ -45,10 +49,17 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+import org.json.JSONObject;
 
 /**
  * Hub Cargolift - locked-down (kiosk) shell around the Cargo Lift Checklist web app.
@@ -78,6 +89,12 @@ public class MainActivity extends Activity {
     private static final long AUTO_LOGIN_GAP_MS = 15000L;
     private static final int REQ_STORAGE = 41;
     private static final int REQ_EXPORT_STORAGE = 42;
+    private static final int REQ_FOLDER = 43;
+
+    private static final String UPDATE_URL =
+            "https://raw.githubusercontent.com/Bachanali/hub-cargolift-apk/main/version.json";
+    private static final String KEY_EXPORT_FOLDER = "export_folder_uri";
+    private static final String KEY_SEEN_UPDATE = "seen_update";
 
     private static final String PAGE_TOKEN_KEY = "cargo_lift_token";
     private static final String PAGE_USER_KEY = "cargo_lift_user";
@@ -246,6 +263,10 @@ public class MainActivity extends Activity {
     private long lastNativeExportAt;
     private String pendingExportName;
     private byte[] pendingExportBytes;
+    private String exportFolderUri = "";
+    private TextView exportFolderLabel;
+    private long updateDownloadId = -1L;
+    private BroadcastReceiver downloadReceiver;
 
     private final Runnable timeoutTask = () -> {
         if (!pageLoaded && !errorShown) {
@@ -274,6 +295,7 @@ public class MainActivity extends Activity {
         configureWebView();
         attemptLoad();
         fadeSplash();
+        handler.postDelayed(this::checkForUpdate, 1200L);   // silent background check
     }
 
     /** Fade the in-activity splash into the branded loading view / dashboard. */
@@ -579,22 +601,155 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------- self update
+
+    /** Silent check against the public GitHub repo; the update option stays hidden unless
+     *  a newer version is actually available (and the user has not dismissed this one). */
+    private void checkForUpdate() {
+        new Thread(() -> {
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(UPDATE_URL + "?t=" + System.currentTimeMillis());
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) return;
+                String body;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) sb.append(line);
+                    body = sb.toString();
+                }
+                JSONObject json = new JSONObject(body);
+                int remote = json.optInt("versionCode", 0);
+                if (remote <= Version.CODE) return;
+                final String name = json.optString("versionName", "");
+                final String notes = json.optString("notes", "");
+                final String apk = json.optString("apkUrl", "");
+                if (apk.isEmpty() || name.equals(prefs.getString(KEY_SEEN_UPDATE, ""))) return;
+                runOnUiThread(() -> showUpdateDialog(name, notes, apk));
+            } catch (Exception ignored) {
+                // offline / GitHub unreachable: fail silently
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }, "hub-update-check").start();
+    }
+
+    private void showUpdateDialog(String versionName, String notes, String apkUrl) {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.update_title)
+                .setMessage(getString(R.string.update_message, versionName, notes))
+                .setPositiveButton(R.string.update_download, (dialog, which) -> {
+                    prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply();
+                    startUpdateDownload(apkUrl, versionName);
+                })
+                .setNegativeButton(R.string.update_later, (dialog, which) ->
+                        prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply())
+                .show();
+    }
+
+    private void startUpdateDownload(String apkUrl, String versionName) {
+        try {
+            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (dm == null) return;
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(apkUrl));
+            req.setMimeType("application/vnd.android.package-archive");
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
+                    "HubCargolift_v" + versionName + ".apk");
+            updateDownloadId = dm.enqueue(req);
+        } catch (Exception e) {
+            Toast.makeText(this, R.string.update_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void registerDownloadReceiver() {
+        if (downloadReceiver != null) return;
+        downloadReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (updateDownloadId < 0L) return;
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+                if (id != updateDownloadId) return;
+                updateDownloadId = -1L;
+                DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                if (dm == null) return;
+                DownloadManager.Query query = new DownloadManager.Query();
+                query.setFilterById(id);
+                Cursor cursor = dm.query(query);
+                if (cursor == null) return;
+                try {
+                    if (!cursor.moveToFirst()) return;
+                    int status = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        Uri uri = dm.getUriForDownloadedFile(id);
+                        if (uri != null) promptInstall(uri);
+                    } else {
+                        runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                                R.string.update_failed, Toast.LENGTH_SHORT).show());
+                    }
+                } finally {
+                    cursor.close();
+                }
+            }
+        };
+        try {
+            registerReceiver(downloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        } catch (Exception e) {
+            downloadReceiver = null;
+        }
+    }
+
+    private void promptInstall(Uri uri) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, R.string.update_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
+
     // ---------------------------------------------------------------- native export
 
     /** App-owned "Save As" dialog - replaces the browser download/save UI for exports. */
     private void showSaveDialog(String name, byte[] bytes) {
         if (isFinishing() || isDestroyed()) return;
-        EditText input = new EditText(this);
+        View view = getLayoutInflater().inflate(R.layout.dialog_save_export, null);
+        EditText input = view.findViewById(R.id.export_name);
         input.setText(name);
-        input.setSingleLine(true);
-        input.setSelectAllOnFocus(true);
-        int dp = (int) getResources().getDisplayMetrics().density;
-        input.setPadding(18 * dp, 12 * dp, 18 * dp, 12 * dp);
+        input.setSelection(name.length());
+        exportFolderLabel = view.findViewById(R.id.export_folder);
+        exportFolderUri = prefs.getString(KEY_EXPORT_FOLDER, "");
+        updateFolderLabel();
+
+        view.findViewById(R.id.export_choose).setOnClickListener(v -> {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+            try {
+                startActivityForResult(intent, REQ_FOLDER);
+            } catch (Exception e) {
+                Toast.makeText(this, R.string.export_failed, Toast.LENGTH_SHORT).show();
+            }
+        });
+        view.findViewById(R.id.export_default).setOnClickListener(v -> {
+            exportFolderUri = "";
+            prefs.edit().putString(KEY_EXPORT_FOLDER, "").apply();
+            updateFolderLabel();
+        });
 
         new AlertDialog.Builder(this)
                 .setTitle(R.string.save_export_title)
-                .setMessage(R.string.save_export_msg)
-                .setView(input)
+                .setView(view)
                 .setPositiveButton(R.string.save_export_action, (dialog, which) -> {
                     String typed = input.getText().toString().trim();
                     if (typed.isEmpty()) typed = name;
@@ -605,7 +760,81 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void updateFolderLabel() {
+        if (exportFolderLabel == null) return;
+        if (exportFolderUri == null || exportFolderUri.isEmpty()) {
+            exportFolderLabel.setText(R.string.export_default_label);
+            return;
+        }
+        try {
+            Uri tree = Uri.parse(exportFolderUri);
+            String id = DocumentsContract.getTreeDocumentId(tree);
+            String shown = id.contains("/") ? id.substring(id.lastIndexOf('/') + 1) : id;
+            exportFolderLabel.setText(getString(R.string.export_save_to) + ": " + shown);
+        } catch (Exception e) {
+            exportFolderLabel.setText(R.string.export_default_label);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_FOLDER || resultCode != RESULT_OK
+                || data == null || data.getData() == null) return;
+        Uri tree = data.getData();
+        try {
+            getContentResolver().takePersistableUriPermission(tree,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        } catch (Exception ignored) {
+            // some providers do not allow persisting; selection still works for this save
+        }
+        exportFolderUri = tree.toString();
+        prefs.edit().putString(KEY_EXPORT_FOLDER, exportFolderUri).apply();
+        updateFolderLabel();
+    }
+
     private void writeExport(String name, byte[] bytes) {
+        String chosenFolder = exportFolderUri;
+        if (chosenFolder == null || chosenFolder.isEmpty()) {
+            chosenFolder = prefs.getString(KEY_EXPORT_FOLDER, "");
+        }
+        if (chosenFolder != null && !chosenFolder.isEmpty()) {
+            final String folder = chosenFolder;
+            new Thread(() -> {
+                boolean ok = false;
+                try {
+                    Uri tree = Uri.parse(folder);
+                    Uri doc = DocumentsContract.createDocument(
+                            getContentResolver(), tree, mimeFor(name), name);
+                    if (doc == null) {
+                        int dot = name.lastIndexOf('.');
+                        String stem = dot > 0 ? name.substring(0, dot) : name;
+                        String ext = dot > 0 ? name.substring(dot) : "";
+                        doc = DocumentsContract.createDocument(getContentResolver(), tree,
+                                mimeFor(name), stem + "_" + System.currentTimeMillis() + ext);
+                    }
+                    if (doc != null) {
+                        try (OutputStream os = getContentResolver().openOutputStream(doc)) {
+                            if (os != null) {
+                                os.write(bytes);
+                                os.flush();
+                                ok = true;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    ok = false;
+                }
+                final boolean saved = ok;
+                runOnUiThread(() -> Toast.makeText(this,
+                        saved ? getString(R.string.export_saved_custom, name)
+                                : getString(R.string.export_failed),
+                        Toast.LENGTH_LONG).show());
+            }, "hub-cargolift-export").start();
+            return;
+        }
+
         if (Build.VERSION.SDK_INT < 29
                 && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -785,6 +1014,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        registerDownloadReceiver();
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm == null || networkCallback != null) return;
         networkCallback = new ConnectivityManager.NetworkCallback() {
@@ -820,6 +1050,14 @@ public class MainActivity extends Activity {
             }
         }
         networkCallback = null;
+        if (downloadReceiver != null) {
+            try {
+                unregisterReceiver(downloadReceiver);
+            } catch (Exception ignored) {
+                // already unregistered
+            }
+            downloadReceiver = null;
+        }
         super.onStop();
     }
 

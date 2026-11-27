@@ -1,0 +1,6 @@
+{
+  "versionCode": 6,
+  "versionName": "1.5",
+  "apkUrl": "https://raw.githubusercontent.com/Bachanali/hub-cargolift-apk/main/HubCargolift.apk",
+  "notes": "Native folder picker for exports and silent GitHub update check"
+}
