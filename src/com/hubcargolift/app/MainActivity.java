@@ -4,10 +4,8 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
@@ -44,6 +42,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -257,7 +256,59 @@ public class MainActivity extends Activity {
     private String pendingExportName;
     private byte[] pendingExportBytes;
     private long updateDownloadId = -1L;
-    private BroadcastReceiver downloadReceiver;
+    private Uri updateDownloadedUri;
+    private AlertDialog updateDialog;
+    private ProgressBar updateBar;
+    private TextView updateStatusText;
+    private Button updateDownloadBtn;
+    private Button updateInstallBtn;
+
+    /** Polls DownloadManager and renders 0-100% inside the update popup. */
+    private final Runnable updateProgressTask = new Runnable() {
+        @Override
+        public void run() {
+            if (updateDialog == null || !updateDialog.isShowing() || updateDownloadId < 0L) return;
+            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (dm == null) return;
+            DownloadManager.Query query = new DownloadManager.Query();
+            query.setFilterById(updateDownloadId);
+            Cursor cursor = dm.query(query);
+            if (cursor != null) {
+                try {
+                    if (cursor.moveToFirst()) {
+                        int status = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                        long soFar = cursor.getLong(cursor.getColumnIndex(
+                                DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                        long total = cursor.getLong(cursor.getColumnIndex(
+                                DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                        int pct = total > 0 ? (int) Math.min(100L, soFar * 100L / total) : 0;
+                        updateBar.setProgress(pct);
+                        updateStatusText.setText(getString(R.string.update_status_downloading, pct));
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                            updateDownloadedUri = dm.getUriForDownloadedFile(updateDownloadId);
+                            updateDownloadId = -1L;
+                            updateBar.setProgress(100);
+                            updateStatusText.setText(R.string.update_status_done);
+                            updateDownloadBtn.setVisibility(View.GONE);
+                            updateInstallBtn.setVisibility(View.VISIBLE);
+                            return;
+                        }
+                        if (status == DownloadManager.STATUS_FAILED) {
+                            updateDownloadId = -1L;
+                            updateStatusText.setText(R.string.update_status_failed);
+                            updateDownloadBtn.setEnabled(true);
+                            return;
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // query failed - try again on the next tick
+                } finally {
+                    cursor.close();
+                }
+            }
+            handler.postDelayed(this, 400L);
+        }
+    };
 
     private final Runnable timeoutTask = () -> {
         if (!pageLoaded && !errorShown) {
@@ -631,16 +682,43 @@ public class MainActivity extends Activity {
 
     private void showUpdateDialog(String versionName, String notes, String apkUrl) {
         if (isFinishing() || isDestroyed()) return;
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.update_title)
-                .setMessage(getString(R.string.update_message, versionName, notes))
-                .setPositiveButton(R.string.update_download, (dialog, which) -> {
-                    prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply();
-                    startUpdateDownload(apkUrl, versionName);
-                })
-                .setNegativeButton(R.string.update_later, (dialog, which) ->
-                        prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply())
-                .show();
+        View view = getLayoutInflater().inflate(R.layout.dialog_update, null);
+        ((TextView) view.findViewById(R.id.update_version)).setText(
+                getString(R.string.update_current_new, Version.NAME, versionName));
+        ((TextView) view.findViewById(R.id.update_notes)).setText(notes);
+
+        updateBar = view.findViewById(R.id.update_progress);
+        updateStatusText = view.findViewById(R.id.update_status);
+        updateDownloadBtn = view.findViewById(R.id.update_download);
+        updateInstallBtn = view.findViewById(R.id.update_install);
+        updateDownloadId = -1L;
+        updateDownloadedUri = null;
+        updateBar.setProgress(0);
+        updateStatusText.setText(R.string.update_status_ready);
+        updateDownloadBtn.setEnabled(true);
+        updateDownloadBtn.setVisibility(View.VISIBLE);
+        updateInstallBtn.setVisibility(View.GONE);
+
+        updateDownloadBtn.setOnClickListener(v -> {
+            prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply();
+            updateDownloadBtn.setEnabled(false);
+            updateStatusText.setText(getString(R.string.update_status_downloading, 0));
+            startUpdateDownload(apkUrl, versionName);
+        });
+        updateInstallBtn.setOnClickListener(v -> {
+            if (updateDownloadedUri != null) promptInstall(updateDownloadedUri);
+        });
+        view.findViewById(R.id.update_later).setOnClickListener(v -> {
+            prefs.edit().putString(KEY_SEEN_UPDATE, versionName).apply();
+            if (updateDialog != null) updateDialog.dismiss();
+        });
+
+        updateDialog = new AlertDialog.Builder(this).setView(view).create();
+        updateDialog.setOnDismissListener(d -> {
+            handler.removeCallbacks(updateProgressTask);
+            updateDialog = null;
+        });
+        updateDialog.show();
     }
 
     private void startUpdateDownload(String apkUrl, String versionName) {
@@ -653,46 +731,11 @@ public class MainActivity extends Activity {
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
                     "HubCargolift_v" + versionName + ".apk");
             updateDownloadId = dm.enqueue(req);
+            handler.removeCallbacks(updateProgressTask);
+            handler.post(updateProgressTask);
         } catch (Exception e) {
-            Toast.makeText(this, R.string.update_failed, Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private void registerDownloadReceiver() {
-        if (downloadReceiver != null) return;
-        downloadReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (updateDownloadId < 0L) return;
-                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
-                if (id != updateDownloadId) return;
-                updateDownloadId = -1L;
-                DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-                if (dm == null) return;
-                DownloadManager.Query query = new DownloadManager.Query();
-                query.setFilterById(id);
-                Cursor cursor = dm.query(query);
-                if (cursor == null) return;
-                try {
-                    if (!cursor.moveToFirst()) return;
-                    int status = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS));
-                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                        Uri uri = dm.getUriForDownloadedFile(id);
-                        if (uri != null) promptInstall(uri);
-                    } else {
-                        runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                                R.string.update_failed, Toast.LENGTH_SHORT).show());
-                    }
-                } finally {
-                    cursor.close();
-                }
-            }
-        };
-        try {
-            registerReceiver(downloadReceiver,
-                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
-        } catch (Exception e) {
-            downloadReceiver = null;
+            updateStatusText.setText(R.string.update_status_failed);
+            updateDownloadBtn.setEnabled(true);
         }
     }
 
@@ -874,7 +917,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
-        registerDownloadReceiver();
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm == null || networkCallback != null) return;
         networkCallback = new ConnectivityManager.NetworkCallback() {
@@ -910,14 +952,6 @@ public class MainActivity extends Activity {
             }
         }
         networkCallback = null;
-        if (downloadReceiver != null) {
-            try {
-                unregisterReceiver(downloadReceiver);
-            } catch (Exception ignored) {
-                // already unregistered
-            }
-            downloadReceiver = null;
-        }
         super.onStop();
     }
 
@@ -930,6 +964,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        if (updateDialog != null && updateDialog.isShowing()) {
+            try {
+                updateDialog.dismiss();
+            } catch (Exception ignored) {
+                // activity going away
+            }
+        }
+        updateDialog = null;
         if (webView != null) {
             webView.destroy();
             webView = null;

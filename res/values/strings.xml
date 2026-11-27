@@ -30,7 +30,13 @@
     <string name="export_default_label">Downloads / Hub Cargolift</string>
     <string name="update_title">Update available</string>
     <string name="update_message">Version %1$s is ready.\n%2$s</string>
-    <string name="update_download">Download &amp; install</string>
+    <string name="update_download">Download update</string>
+    <string name="update_install">Install now</string>
     <string name="update_later">Later</string>
     <string name="update_failed">Couldn\'t download the update</string>
+    <string name="update_current_new">Version %1$s → %2$s</string>
+    <string name="update_status_ready">Ready to download</string>
+    <string name="update_status_downloading">Downloading… %1$d%%</string>
+    <string name="update_status_done">Download complete — ready to install</string>
+    <string name="update_status_failed">Download failed. Tap Download to retry.</string>
 </resources>

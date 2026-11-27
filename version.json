@@ -1,6 +1,6 @@
 {
-  "versionCode": 7,
-  "versionName": "1.6",
+  "versionCode": 8,
+  "versionName": "1.7",
   "apkUrl": "https://raw.githubusercontent.com/Bachanali/hub-cargolift-apk/main/HubCargolift.apk",
-  "notes": "Android built-in Save As for exports (reliable content-URI save)"
+  "notes": "In-app update popup with 0-100% progress bar and Install button"
 }
