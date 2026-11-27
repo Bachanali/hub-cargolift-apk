@@ -12,13 +12,14 @@ A kiosk-style Android wrapper around the **Cargo Lift Checklist** web app:
 - Auto-login: the web app's `cargo_lift_token` / `cargo_lift_user` are mirrored into Android `SharedPreferences`; the session is restored once per launch (restoring it repeatedly caused a login ↔ dashboard loop after a 401).
 - Username + password are saved on the first login and re-submitted once if the session expires. A manual **Logout** clears the saved sign-in.
 - Mobile view with pinch zoom enabled (0.25x–5x).
-- Downloads (e.g. backup) go through Android `DownloadManager`, including the Bearer token.
+- Exports (DB backup / Excel): Blob downloads are captured in the WebView and handed to a **native Save As dialog** — the user picks/confirms the filename and the file is written to `Downloads/Hub Cargolift/`. No browser save-as UI is shown. API 29+ uses the Downloads MediaStore collection; lower APIs use a public folder.
+- Non-export downloads go through Android `DownloadManager`, including the Bearer token.
 
 ## Files
 
 | Path | Purpose |
 | --- | --- |
-| `HubCargolift.apk` | Signed, ready-to-install APK (currently v1.3 / versionCode 4) |
+| `HubCargolift.apk` | Signed, ready-to-install APK (currently v1.4 / versionCode 5) |
 | `AndroidManifest.xml` | Manifest (minSdk 23, targetSdk 34) |
 | `src/com/hubcargolift/app/` | `MainActivity.java` — kiosk WebView, native bridge, session handling |
 | `res/` | Layouts, colours, strings, launcher/adaptive icons |

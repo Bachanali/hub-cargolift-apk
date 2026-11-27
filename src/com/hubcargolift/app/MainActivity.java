@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -22,6 +23,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Base64;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.animation.AlphaAnimation;
@@ -42,6 +44,11 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 
 /**
  * Hub Cargolift - locked-down (kiosk) shell around the Cargo Lift Checklist web app.
@@ -70,6 +77,7 @@ public class MainActivity extends Activity {
     private static final int MAX_AUTO_LOGIN = 3;
     private static final long AUTO_LOGIN_GAP_MS = 15000L;
     private static final int REQ_STORAGE = 41;
+    private static final int REQ_EXPORT_STORAGE = 42;
 
     private static final String PAGE_TOKEN_KEY = "cargo_lift_token";
     private static final String PAGE_USER_KEY = "cargo_lift_user";
@@ -169,6 +177,51 @@ public class MainActivity extends Activity {
             })();
             """;
 
+    /**
+     * Catch exports generated as Blob + <a download> and hand them to the native side,
+     * so no browser "Save as" UI is ever shown. The site's own click still runs, but the
+     * WebView download is ignored by startDownload() while a native save is pending.
+     */
+    private static final String EXPORT_HOOK_JS = """
+            (function () {
+              try {
+                if (typeof window.HubAppNative === 'undefined') return;
+                if (window.__hubExportHook) return;
+                window.__hubExportHook = 1;
+                var origCreate = URL.createObjectURL;
+                var origClick = HTMLAnchorElement.prototype.click;
+                var pending = null;
+                URL.createObjectURL = function (blob) {
+                  try {
+                    if (blob && typeof blob.size === 'number' && blob.size > 0
+                        && blob.size < 60 * 1024 * 1024) pending = blob;
+                  } catch (e) {}
+                  return origCreate.call(URL, blob);
+                };
+                HTMLAnchorElement.prototype.click = function () {
+                  try {
+                    if (pending && this.href && String(this.href).indexOf('blob:') === 0) {
+                      var blob = pending;
+                      pending = null;
+                      var name = this.download || 'cargo_lift_export';
+                      var reader = new FileReader();
+                      reader.onload = function () {
+                        try {
+                          var s = String(reader.result || '');
+                          var i = s.indexOf(',');
+                          var b64 = i >= 0 ? s.slice(i + 1) : s;
+                          if (b64) window.HubAppNative.exportBlob(name, b64);
+                        } catch (e) {}
+                      };
+                      reader.readAsDataURL(blob);
+                    }
+                  } catch (e) {}
+                  return origClick.apply(this, arguments);
+                };
+              } catch (e) {}
+            })();
+            """;
+
     private WebView webView;
     private View splashOverlay;
     private View loadingView;
@@ -190,6 +243,9 @@ public class MainActivity extends Activity {
     private int autoLoginAttempts;
 
     private String[] pendingDownload;
+    private long lastNativeExportAt;
+    private String pendingExportName;
+    private byte[] pendingExportBytes;
 
     private final Runnable timeoutTask = () -> {
         if (!pageLoaded && !errorShown) {
@@ -323,6 +379,7 @@ public class MainActivity extends Activity {
 
                 inject(VIEWPORT_JS);
                 inject(String.format(SYNC_JS, PAGE_TOKEN_KEY, PAGE_USER_KEY));
+                inject(EXPORT_HOOK_JS);
                 if (url != null && url.contains(LOGIN_PAGE)) {
                     inject(String.format(LOGIN_JS, PAGE_TOKEN_KEY));
                 }
@@ -490,6 +547,8 @@ public class MainActivity extends Activity {
     private void startDownload(String url, String userAgent, String contentDisposition,
                                String mimeType, long contentLength) {
         if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) return;
+        // Blob exports are saved natively; ignore the WebView's copy of the same download.
+        if (System.currentTimeMillis() - lastNativeExportAt < 6000L) return;
         String name = URLUtil.guessFileName(url, contentDisposition, mimeType);
         if (Build.VERSION.SDK_INT < 29
                 && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -520,9 +579,115 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------- native export
+
+    /** App-owned "Save As" dialog - replaces the browser download/save UI for exports. */
+    private void showSaveDialog(String name, byte[] bytes) {
+        if (isFinishing() || isDestroyed()) return;
+        EditText input = new EditText(this);
+        input.setText(name);
+        input.setSingleLine(true);
+        input.setSelectAllOnFocus(true);
+        int dp = (int) getResources().getDisplayMetrics().density;
+        input.setPadding(18 * dp, 12 * dp, 18 * dp, 12 * dp);
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.save_export_title)
+                .setMessage(R.string.save_export_msg)
+                .setView(input)
+                .setPositiveButton(R.string.save_export_action, (dialog, which) -> {
+                    String typed = input.getText().toString().trim();
+                    if (typed.isEmpty()) typed = name;
+                    typed = typed.replaceAll("[\\\\/:*?\"<>|]", "_");
+                    writeExport(typed, bytes);
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void writeExport(String name, byte[] bytes) {
+        if (Build.VERSION.SDK_INT < 29
+                && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingExportName = name;
+            pendingExportBytes = bytes;
+            requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    REQ_EXPORT_STORAGE);
+            return;
+        }
+        new Thread(() -> {
+            boolean ok = false;
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    // content://media/external/downloads == MediaStore.Downloads (API 29+),
+                    // written with plain column names so older devices never resolve that class.
+                    ContentValues values = new ContentValues();
+                    values.put("_display_name", name);
+                    values.put("mime_type", mimeFor(name));
+                    values.put("relative_path", Environment.DIRECTORY_DOWNLOADS + "/Hub Cargolift");
+                    Uri uri = getContentResolver().insert(
+                            Uri.parse("content://media/external/downloads"), values);
+                    if (uri != null) {
+                        try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                            if (os != null) {
+                                os.write(bytes);
+                                os.flush();
+                                ok = true;
+                            }
+                        }
+                    }
+                } else {
+                    File dir = new File(Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS), "Hub Cargolift");
+                    if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create folder");
+                    File out = new File(dir, name);
+                    if (out.exists()) {
+                        int dot = name.lastIndexOf('.');
+                        String stem = dot > 0 ? name.substring(0, dot) : name;
+                        String ext = dot > 0 ? name.substring(dot) : "";
+                        out = new File(dir, stem + "_" + System.currentTimeMillis() + ext);
+                    }
+                    try (FileOutputStream fos = new FileOutputStream(out)) {
+                        fos.write(bytes);
+                    }
+                    ok = true;
+                }
+            } catch (Exception e) {
+                ok = false;
+            }
+            final boolean saved = ok;
+            runOnUiThread(() -> Toast.makeText(this,
+                    saved ? getString(R.string.export_saved, name) : getString(R.string.export_failed),
+                    Toast.LENGTH_LONG).show());
+        }, "hub-cargolift-export").start();
+    }
+
+    private static String mimeFor(String name) {
+        String n = name.toLowerCase();
+        if (n.endsWith(".xlsx")) {
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        }
+        if (n.endsWith(".db") || n.endsWith(".sqlite")) return "application/x-sqlite3";
+        return "application/octet-stream";
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_EXPORT_STORAGE) {
+            String name = pendingExportName;
+            byte[] bytes = pendingExportBytes;
+            pendingExportName = null;
+            pendingExportBytes = null;
+            if (name != null && bytes != null
+                    && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                writeExport(name, bytes);
+            } else {
+                Toast.makeText(this, R.string.export_failed, Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
         if (requestCode != REQ_STORAGE) return;
         String[] job = pendingDownload;
         pendingDownload = null;
@@ -570,6 +735,21 @@ public class MainActivity extends Activity {
         public void saveCredentials(String username, String password) {
             if (username == null || username.isEmpty() || password == null || password.isEmpty()) return;
             prefs.edit().putString(KEY_USERNAME, username).putString(KEY_PASSWORD, password).apply();
+        }
+
+        /** Export produced by the web app as a Blob: show our native Save As dialog. */
+        @android.webkit.JavascriptInterface
+        public void exportBlob(String name, String base64) {
+            try {
+                byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                if (bytes.length == 0) return;
+                lastNativeExportAt = System.currentTimeMillis();
+                String safe = (name == null || name.trim().isEmpty())
+                        ? "cargo_lift_export" : name.trim();
+                runOnUiThread(() -> showSaveDialog(safe, bytes));
+            } catch (Exception ignored) {
+                // invalid blob - nothing to save
+            }
         }
 
         /** The user pressed Logout on purpose: forget the saved sign-in. */

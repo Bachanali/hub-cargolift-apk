@@ -16,4 +16,9 @@
     <string name="blocked_link">Only the Cargo Lift app is available inside Hub Cargolift.</string>
     <string name="download_started">Download started</string>
     <string name="download_failed">Download couldn\'t start</string>
+    <string name="save_export_title">Save export</string>
+    <string name="save_export_msg">The file will be saved in Downloads / Hub Cargolift</string>
+    <string name="save_export_action">Save</string>
+    <string name="export_saved">Saved to Downloads/Hub Cargolift/%1$s</string>
+    <string name="export_failed">Couldn\'t save the export</string>
 </resources>
