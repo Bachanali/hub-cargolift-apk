@@ -1,6 +1,6 @@
 {
-  "versionCode": 8,
-  "versionName": "1.7",
+  "versionCode": 9,
+  "versionName": "1.8",
   "apkUrl": "https://raw.githubusercontent.com/Bachanali/hub-cargolift-apk/main/HubCargolift.apk",
-  "notes": "In-app update popup with 0-100% progress bar and Install button"
+  "notes": "More reliable auto-login, password sync, smoother native transitions"
 }

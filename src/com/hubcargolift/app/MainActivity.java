@@ -117,7 +117,15 @@ public class MainActivity extends Activity {
                 if (typeof window.HubAppNative === 'undefined') return;
                 var t = null, u = null;
                 try { t = localStorage.getItem('%s'); u = localStorage.getItem('%s'); } catch (e) {}
-                if (t) window.HubAppNative.setSession(t, u || '');
+                var had = false;
+                try { had = sessionStorage.getItem('hub_had_session') === '1'; } catch (e) {}
+                if (t) {
+                  try { sessionStorage.setItem('hub_had_session', '1'); } catch (e) {}
+                  window.HubAppNative.setSession(t, u || '');
+                } else if (had) {
+                  try { sessionStorage.removeItem('hub_had_session'); } catch (e) {}
+                  window.HubAppNative.onSessionCleared();
+                }
                 var b = document.getElementById('btnLogout');
                 if (b && !b.__hubHooked) {
                   b.__hubHooked = 1;
@@ -231,6 +239,36 @@ public class MainActivity extends Activity {
             })();
             """;
 
+    /** Keep the auto-login password in sync when the user changes it inside the web app. */
+    private static final String PASSWORD_HOOK_JS = """
+            (function () {
+              try {
+                if (typeof window.HubAppNative === 'undefined') return;
+                if (window.__hubPwdHook) return;
+                window.__hubPwdHook = 1;
+                document.addEventListener('click', function (e) {
+                  try {
+                    var el = e.target;
+                    if (!el || el.id !== 'mpSave') return;
+                    var np = document.getElementById('mpNew');
+                    if (!np || !np.value) return;
+                    var next = np.value;
+                    var tries = 0;
+                    var timer = setInterval(function () {
+                      tries++;
+                      if (!document.getElementById('mpSave')) {
+                        clearInterval(timer);
+                        try { window.HubAppNative.passwordChanged(next); } catch (err) {}
+                      } else if (tries > 12) {
+                        clearInterval(timer);
+                      }
+                    }, 300);
+                  } catch (err) {}
+                }, true);
+              } catch (err) {}
+            })();
+            """;
+
     private WebView webView;
     private View splashOverlay;
     private View loadingView;
@@ -250,6 +288,7 @@ public class MainActivity extends Activity {
     private long lastBackPress;
     private long lastAttemptAt = -AUTO_RETRY_GAP_MS;   // device uptime can be tiny right after boot
     private int autoLoginAttempts;
+    private boolean warnedAutoLogin;
 
     private String[] pendingDownload;
     private long lastNativeExportAt;
@@ -326,6 +365,7 @@ public class MainActivity extends Activity {
 
         webView = findViewById(R.id.webview);
         splashOverlay = findViewById(R.id.splash_overlay);
+        ((TextView) findViewById(R.id.splash_version)).setText("v" + Version.NAME);
         loadingView = findViewById(R.id.loading_view);
         errorView = findViewById(R.id.error_view);
         errorTitle = findViewById(R.id.error_title);
@@ -422,7 +462,7 @@ public class MainActivity extends Activity {
                 pageLoaded = false;
                 handler.removeCallbacks(timeoutTask);
                 if (!errorShown) {
-                    loadingView.setVisibility(View.VISIBLE);
+                    showLoading();
                 }
                 inject(VIEWPORT_JS);
                 if (restorePending) {
@@ -437,13 +477,14 @@ public class MainActivity extends Activity {
                 if (errorShown) return;
                 pageLoaded = true;
                 handler.removeCallbacks(timeoutTask);
-                loadingView.setVisibility(View.GONE);
+                hideLoading(true);
                 errorView.setVisibility(View.GONE);
                 webView.setVisibility(View.VISIBLE);
 
                 inject(VIEWPORT_JS);
                 inject(String.format(SYNC_JS, PAGE_TOKEN_KEY, PAGE_USER_KEY));
                 inject(EXPORT_HOOK_JS);
+                inject(PASSWORD_HOOK_JS);
                 if (url != null && url.contains(LOGIN_PAGE)) {
                     inject(String.format(LOGIN_JS, PAGE_TOKEN_KEY));
                 }
@@ -538,6 +579,36 @@ public class MainActivity extends Activity {
         if (webView != null) webView.evaluateJavascript(js, null);
     }
 
+    private void showLoading() {
+        loadingView.clearAnimation();
+        loadingView.setVisibility(View.VISIBLE);
+    }
+
+    private void hideLoading(boolean animated) {
+        if (!animated || loadingView.getVisibility() == View.GONE) {
+            loadingView.clearAnimation();
+            loadingView.setVisibility(View.GONE);
+            return;
+        }
+        AlphaAnimation fade = new AlphaAnimation(1f, 0f);
+        fade.setDuration(260);
+        fade.setFillAfter(true);
+        fade.setAnimationListener(new Animation.AnimationListener() {
+            @Override
+            public void onAnimationStart(Animation animation) { }
+
+            @Override
+            public void onAnimationEnd(Animation animation) {
+                loadingView.clearAnimation();
+                loadingView.setVisibility(View.GONE);
+            }
+
+            @Override
+            public void onAnimationRepeat(Animation animation) { }
+        });
+        loadingView.startAnimation(fade);
+    }
+
     private String describeError(int code) {
         switch (code) {
             case WebViewClient.ERROR_HOST_LOOKUP:
@@ -570,7 +641,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(timeoutTask);
         errorView.setVisibility(View.GONE);
         webView.setVisibility(View.VISIBLE);
-        loadingView.setVisibility(View.VISIBLE);
+        showLoading();
 
         if (!isOnline()) {
             showError(getString(R.string.error_no_internet), getString(R.string.error_internet_detail));
@@ -586,7 +657,7 @@ public class MainActivity extends Activity {
         errorShown = true;
         pageLoaded = false;
         handler.removeCallbacks(timeoutTask);
-        loadingView.setVisibility(View.GONE);
+        hideLoading(false);
         webView.setVisibility(View.GONE);
         errorTitle.setText(title);
         errorDetail.setText(detail);
@@ -867,6 +938,24 @@ public class MainActivity extends Activity {
         public void saveCredentials(String username, String password) {
             if (username == null || username.isEmpty() || password == null || password.isEmpty()) return;
             prefs.edit().putString(KEY_USERNAME, username).putString(KEY_PASSWORD, password).apply();
+            autoLoginAttempts = 0;
+            warnedAutoLogin = false;
+        }
+
+        /** The web app deliberately cleared its session (expiry / 401). Drop the stale
+         *  token but KEEP the credentials so auto-login can obtain a fresh one. */
+        @android.webkit.JavascriptInterface
+        public void onSessionCleared() {
+            prefs.edit().remove(KEY_TOKEN).remove(KEY_USER).apply();
+        }
+
+        /** Password changed inside the web app - keep the saved credential in sync. */
+        @android.webkit.JavascriptInterface
+        public void passwordChanged(String newPassword) {
+            if (newPassword == null || newPassword.isEmpty()) return;
+            String username = prefs.getString(KEY_USERNAME, "");
+            if (username.isEmpty()) return;
+            prefs.edit().putString(KEY_PASSWORD, newPassword).apply();
         }
 
         /** Export produced by the web app as a Blob: show our native Save As dialog. */
@@ -895,12 +984,20 @@ public class MainActivity extends Activity {
                     .remove(KEY_LAST_AUTO)
                     .apply();
             autoLoginAttempts = 0;
+            warnedAutoLogin = false;
             restorePending = false;
         }
 
         @android.webkit.JavascriptInterface
         public boolean allowAutoLogin() {
-            if (autoLoginAttempts >= MAX_AUTO_LOGIN) return false;
+            if (autoLoginAttempts >= MAX_AUTO_LOGIN) {
+                if (!warnedAutoLogin) {
+                    warnedAutoLogin = true;
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                            R.string.auto_login_failed, Toast.LENGTH_LONG).show());
+                }
+                return false;
+            }
             long last = prefs.getLong(KEY_LAST_AUTO, 0L);
             return System.currentTimeMillis() - last >= AUTO_LOGIN_GAP_MS;
         }
