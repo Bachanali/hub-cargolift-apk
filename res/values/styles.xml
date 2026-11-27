@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <!-- Same gradient as the splash/loading screens: no colour flash at startup. -->
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:statusBarColor">@color/cargo_deep</item>
+        <item name="android:navigationBarColor">@color/cargo_darkest</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">@color/cargo_accent</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

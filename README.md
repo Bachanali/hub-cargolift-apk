@@ -1,0 +1,46 @@
+# Hub Cargolift (Android APK)
+
+A kiosk-style Android wrapper around the **Cargo Lift Checklist** web app:
+
+`https://1st-instance.tail5b9279.ts.net/Hub_CargoLift/`
+
+## What it does
+
+- App name / launcher icon / splash use the Cargo Lift branding taken from the web project's `logo-default.png`.
+- Full-screen immersive shell — no address bar or browser chrome. Navigation is locked to the app host.
+- Native branded loading screen, splash and error screen (no internet, DNS/server failure, timeout, SSL error, HTTP error). Network recovery retries automatically.
+- Auto-login: the web app's `cargo_lift_token` / `cargo_lift_user` are mirrored into Android `SharedPreferences`; the session is restored once per launch (restoring it repeatedly caused a login ↔ dashboard loop after a 401).
+- Username + password are saved on the first login and re-submitted once if the session expires. A manual **Logout** clears the saved sign-in.
+- Mobile view with pinch zoom enabled (0.25x–5x).
+- Downloads (e.g. backup) go through Android `DownloadManager`, including the Bearer token.
+
+## Files
+
+| Path | Purpose |
+| --- | --- |
+| `HubCargolift.apk` | Signed, ready-to-install APK (currently v1.3 / versionCode 4) |
+| `AndroidManifest.xml` | Manifest (minSdk 23, targetSdk 34) |
+| `src/com/hubcargolift/app/` | `MainActivity.java` — kiosk WebView, native bridge, session handling |
+| `res/` | Layouts, colours, strings, launcher/adaptive icons |
+| `tools/make_icons.py` | Regenerates launcher, adaptive and splash artwork from `tools/assets/logo.png` |
+| `tools/{r8.jar,uber-apk-signer.jar}` | DEX conversion and APK signing |
+| `sdk/android-34/android.jar` | Android compile classpath |
+| `build.sh` | Full build pipeline (no Gradle needed) |
+| `build/` | Generated intermediates — ignored by git |
+
+## Rebuild
+
+```sh
+./build.sh
+```
+
+Output: `HubCargolift.apk` (signed with the Android debug key, v1/v2/v3).
+
+Requires `bash`, `python3` with Pillow, `javac` 17, `aapt2`, `zip` and Java (for D8 / apk signing).
+All of these are available in the AntiGem Linux environment.
+
+## Notes
+
+- The app needs the phone to reach the Tailscale host (or the host must be publicly reachable).
+- Credentials are stored in app-private storage, not encrypted; this is a single-user kiosk app.
+- Every code change should be rebuilt and pushed to this repository together with the updated APK.

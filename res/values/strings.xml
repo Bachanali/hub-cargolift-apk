@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hub Cargolift</string>
+    <string name="splash_tagline">Cargo Lift Checklist</string>
+    <string name="loading_text">Loading Hub Cargolift…</string>
+    <string name="error_title">Couldn\'t load Hub Cargolift</string>
+    <string name="error_no_internet">No internet connection</string>
+    <string name="error_internet_detail">Hub Cargolift needs an internet connection to open your dashboard. Check your Wi‑Fi or mobile data, then try again.</string>
+    <string name="error_generic_detail">We couldn\'t reach the Cargo Lift server. Please check your connection and try again.</string>
+    <string name="error_server_detail">The Cargo Lift server did not respond. Check your internet connection — and make sure Tailscale is connected on this device — then tap Retry.</string>
+    <string name="error_secure_detail">The secure connection to the Cargo Lift server could not be verified. Please try again later.</string>
+    <string name="error_timeout_detail">The server is taking too long to respond. Check your connection and tap Retry.</string>
+    <string name="error_http_detail">The Cargo Lift server returned an error (HTTP %1$d). Please try again in a moment.</string>
+    <string name="retry">Retry</string>
+    <string name="exit_hint">Press back again to exit</string>
+    <string name="blocked_link">Only the Cargo Lift app is available inside Hub Cargolift.</string>
+    <string name="download_started">Download started</string>
+    <string name="download_failed">Download couldn\'t start</string>
+</resources>

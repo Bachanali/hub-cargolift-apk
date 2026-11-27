@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="cargo_blue">#1F6FB5</color>
+    <color name="cargo_brand">#0F4C81</color>
+    <color name="cargo_deep">#0A3358</color>
+    <color name="cargo_darkest">#07213B</color>
+    <color name="cargo_accent">#1F9D63</color>
+    <color name="cargo_white">#FFFFFF</color>
+    <color name="cargo_muted">#B7D2E9</color>
+</resources>
